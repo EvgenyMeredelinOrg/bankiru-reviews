@@ -70,7 +70,7 @@ from bankiru.api.schemas import (
 )
 from bankiru.api.summarizer import summarize_map_reduce
 from bankiru.config import get_settings
-from bankiru.embedder import embed_texts, format_review_for_embedding
+from bankiru.embedder import embed_texts, passages_for_new_rows
 from bankiru.models import Review, ReviewEmbedding
 
 # All routes are registered on this router, which is included in the
@@ -354,6 +354,7 @@ async def post_reviews(
             id_stmt = (
                 select(
                     Review.id,
+                    Review.url,
                     Review.bankName,
                     Review.product,
                     Review.location,
@@ -369,21 +370,12 @@ async def post_reviews(
             id_rows = id_result.all()
 
             if id_rows:
-                review_ids = [row.id for row in id_rows]
-                texts = [
-                    format_review_for_embedding(
-                        bank_name=row.bankName,
-                        product=row.product,
-                        location=row.location,
-                        review_body=row.reviewBody,
-                    )
-                    for row in id_rows
-                ]
+                texts, id_groups = passages_for_new_rows(id_rows)
                 vectors = await embed_texts(texts, mode="passage")
-
                 embedding_rows = [
-                    {"review_id": rid, "embedding": vec}
-                    for rid, vec in zip(review_ids, vectors)
+                    {"review_id": review_id, "embedding": vector}
+                    for vector, review_ids in zip(vectors, id_groups, strict=True)
+                    for review_id in review_ids
                 ]
                 await session.execute(insert(ReviewEmbedding), embedding_rows)
                 await session.commit()
@@ -695,7 +687,7 @@ async def delete_reviews_by_date(
             Review.datePublished <= datetime.combine(end_date, time.max),
         )
         result = await session.execute(statement)
-        deleted = result.rowcount
+        deleted = result.rowcount  # type: ignore[attr-defined]
         await session.commit()
 
     logfire.info(
@@ -745,7 +737,7 @@ async def delete_duplicate_reviews(
             .where(Review.id.not_in(select(keep_ids.c.id)))
         )
         result = await session.execute(statement)
-        deleted = result.rowcount
+        deleted = result.rowcount  # type: ignore[attr-defined]
         await session.commit()
 
     logfire.info("deduplicated: {deleted} rows removed", deleted=deleted)

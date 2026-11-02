@@ -203,6 +203,10 @@ class Settings(BaseSettings):
     # Maximum pause (seconds) when the parser detects a ban/block response
     # from banki.ru before retrying.
     PARSER_BAN_PAUSE_MAX: float = 300.0
+    # 21600 seconds is 6 hours, which ends before the next 00:05 crawl.
+    # 900 seconds is the per-URL connect-retry budget.
+    PARSER_RUN_DEADLINE_SEC: int = 21600
+    PARSER_CONNECT_RETRY_BUDGET_SEC: int = 900
 
     # ── Summarization ────────────────────────────────────────────────────
     # OpenAI-compatible API credentials for the LLM summarization pipeline.
@@ -213,7 +217,7 @@ class Settings(BaseSettings):
     # Default model used for map-reduce summarization of review batches.
     DEFAULT_CLOUD_MODEL: str = "anthropic/claude-sonnet-4.6"
     # Maximum output tokens the model is allowed to generate per call.
-    OUTPUT_TOKENS_LIMIT: int = 50000
+    OUTPUT_TOKENS_LIMIT: int = 8192
 
     # Map-reduce summarizer tuning — these control how large review batches
     # are split into chunks (map phase) and then merged (reduce phase).
@@ -253,10 +257,8 @@ class Settings(BaseSettings):
     # Port the Gradio UI server listens on. Bound to 127.0.0.1 on the host
     # (not 0.0.0.0) — public access goes through the host's Nginx reverse proxy.
     UI_PORT: int = 17060
-    # `*` trusts X-Forwarded-* from any upstream. The container is bound to
-    # 127.0.0.1 on the host so this is safe in the default deployment.
-    # Tighten only if UI_PORT is published to the public internet directly.
-    TRUSTED_HOSTS: CommaList = ["*"]
+    # local dev sets TRUSTED_HOSTS=* or the local proxy address explicitly.
+    TRUSTED_HOSTS: CommaList = ["172.16.89.1"]
     # Secret key for Starlette's SessionMiddleware (signs session cookies).
     # Required in production for OIDC login state persistence across requests.
     SESSION_MIDDLEWARE_SECRET: str | None = None

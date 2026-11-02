@@ -1,14 +1,17 @@
 """Fully sequential crawler on top of `BankiruClient`.
 
-Products are crawled one by one. Within each product, listing pages are
-fetched one by one. For each listing page, detail pages are fetched one by
-one. Every request goes through the same back-off client — there is no
-concurrency anywhere. This mirrors the behaviour of the original parser that
-ran reliably without triggering WAF bans.
+Products are crawled one by one. Each product has two listing passes,
+``rate=1`` then ``rate=2``. Pages and detail pages are fetched one by one.
+Every request goes through the same back-off client.
 
-Connect-level errors (WAF bans) are handled transparently by the client:
-it backs off and retries indefinitely until the connection succeeds, so the
-crawler never loses data due to a temporary ban.
+A listing fetch or parse error ends that rate pass. The other rate still
+runs. A challenge page ends both passes of that product. Later products
+still run, and a partial collection is still POSTed. A page whose reviews
+are not the requested rate raises ``RatingFilterMissed`` and the run does
+not POST. A detail URL already resolved in this run, or already stored for
+this date window with one non-empty location, reuses that location and
+still stores the row. Connect retries stop at the per-URL budget. The run
+itself stops at the deadline passed into the client.
 """
 
 from __future__ import annotations
@@ -16,49 +19,223 @@ from __future__ import annotations
 import datetime as dt
 import itertools
 import json
+import logging
+import re
+from dataclasses import dataclass
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import logfire
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 from dateutil.utils import today
+from sqlalchemy import select
 
 from bankiru.config import get_settings
+from bankiru.db import get_session_maker
+from bankiru.models import Review
+from bankiru.parser.challenge import is_challenge_page
 from bankiru.parser.client import BankiruClient
+from bankiru.parser.errors import (
+    ChallengePageError,
+    EmptyMarkupError,
+    ListingFetchError,
+    ListingParseError,
+    RatingFilterMissed,
+)
 from bankiru.parser.settings import (
     BASE_URL,
     LOC_PATTERN,
     PAGE_URL,
     PRODUCTS,
-    REVIEW_CONTENT_PATTERN,
+    RATES,
     REVIEW_URL_PATTERN,
 )
 from bankiru.parser.tools import clean_text_pipe
 
+logger = logging.getLogger("bankiru.parser.crawler")
+
+
+@dataclass(frozen=True)
+class ParsedReview:
+    review_body: str
+    date_published: dt.datetime
+    bank_name: str
+    detail_path: str
+    rating: str = "1"
+
+
+def _walk_reviews(node: object) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if isinstance(node, dict):
+        raw_type = node.get("@type")
+        types = raw_type if isinstance(raw_type, list) else [raw_type]
+        if "Review" in types:
+            found.append(node)
+        for value in node.values():
+            found.extend(_walk_reviews(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_walk_reviews(item))
+    return found
+
+
+_VALID_ESCAPE = re.compile(r'\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})')
+
+
+def repair_json_escapes(raw: str) -> str:
+    """Keep valid JSON escapes intact and double every other backslash.
+
+    Valid pairs are a backslash plus one of " \\ / b f n r t, or a backslash
+    u and four hex digits. A valid pair is copied as two (or six) characters.
+    Any other backslash, including a short \\u12 and a trailing backslash,
+    becomes two backslashes. The v6 regex did not consume the valid pair, so
+    a later bad backslash in the same string survived.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        if raw[i] != "\\":
+            out.append(raw[i])
+            i += 1
+            continue
+        match = _VALID_ESCAPE.match(raw, i)
+        if match:
+            out.append(match.group(0))
+            i = match.end()
+        else:
+            out.append("\\\\")
+            i += 1
+    return "".join(out)
+
+
+def loads_listing_json(raw: str) -> object:
+    try:
+        return json.loads(repair_json_escapes(raw), strict=False)
+    except json.JSONDecodeError as exc:
+        raise ListingParseError("json-ld") from exc
+
+
+def parse_listing(html: str) -> list[ParsedReview]:
+    """Return every Review on the page, in listing order, any rating."""
+    if is_challenge_page(html):
+        raise ChallengePageError("challenge page")
+    reviews: list[dict[str, Any]] = []
+    for match in re.finditer(
+        r"""<script[^>]*type=["']application/ld\+json["'][^>]*>(.*?)</script>""",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    ):
+        payload = loads_listing_json(match.group(1))
+        reviews.extend(_walk_reviews(payload))
+    page_text = " ".join(html.split())
+    paths = [item.group(1) for item in REVIEW_URL_PATTERN.finditer(page_text)]
+    if len(reviews) != len(paths):
+        raise ListingParseError(f"{len(reviews)} reviews vs {len(paths)} urls")
+    parsed: list[ParsedReview] = []
+    for review, path in zip(reviews, paths):
+        try:
+            body = review["reviewBody"]
+            stamp = dt.datetime.strptime(review["datePublished"], "%Y-%m-%d %H:%M:%S")
+            bank = review["itemReviewed"]["name"].strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ListingParseError("review fields") from exc
+        rating_node = review.get("reviewRating")
+        rating = ""
+        if isinstance(rating_node, dict):
+            rating = str(rating_node.get("ratingValue", ""))
+        parsed.append(ParsedReview(body, stamp, bank, path, rating))
+    return parsed
+
+
+def assert_rate(records: list[ParsedReview], rate: str) -> None:
+    for record in records:
+        if record.rating != rate:
+            raise RatingFilterMissed(rate)
+
+
+def listing_records(html: str) -> list[ParsedReview]:
+    """Reviews with ratingValue 1 or 2. Pagination uses `parse_listing`."""
+    return [row for row in parse_listing(html) if row.rating in {"1", "2"}]
+
+
+def select_page(
+    records: list[ParsedReview],
+    start_date: dt.datetime,
+    end_date: dt.datetime,
+) -> tuple[list[ParsedReview], bool]:
+    kept: list[ParsedReview] = []
+    for record in records:
+        if record.date_published >= end_date:
+            continue
+        if record.date_published < start_date:
+            return kept, True
+        kept.append(record)
+    return kept, False
+
+
+def location_from_detail(response_text: str | None) -> str:
+    if response_text is None or is_challenge_page(response_text):
+        return ""
+    match = LOC_PATTERN.search(response_text)
+    return match.group(1) if match else ""
+
+
+def detail_request_url(stored_url: str) -> str:
+    if stored_url.endswith("/"):
+        return stored_url
+    return stored_url + "/"
+
+
+def collapse_locations(rows: list[tuple[str, str]]) -> dict[str, str]:
+    """Keep a url only when every location in the window agrees and is non-empty."""
+    grouped: dict[str, set[str]] = {}
+    for url, location in rows:
+        grouped.setdefault(url, set()).add(location)
+    known: dict[str, str] = {}
+    for url, locations in grouped.items():
+        if len(locations) != 1:
+            continue
+        only = next(iter(locations))
+        if only:
+            known[url] = only
+    return known
+
+
+async def load_known_locations(
+    start_date: dt.datetime,
+    end_date: dt.datetime,
+) -> dict[str, str]:
+    try:
+        async with get_session_maker()() as session:
+            rows = (
+                await session.execute(
+                    select(Review.url, Review.location).where(
+                        Review.datePublished >= start_date,
+                        Review.datePublished < end_date,
+                    )
+                )
+            ).all()
+    except Exception as exc:
+        logger.error("location prefetch failed: %s", type(exc).__name__)
+        return {}
+    return collapse_locations([(url, location) for url, location in rows])
+
 
 class BankiruCrawler:
-    """Sequential crawler. One instance per run; pass it a fresh `BankiruClient`.
-
-    The crawler iterates through all banking products defined in PRODUCTS
-    (settings.py), fetching listing pages and detail pages one at a time.
-    For each product, it paginates through listing pages until it either:
-      - Finds a review older than start_date (hit_left_boundary)
-      - Finds a page with no review markup (past the last page)
-
-    Collected records are deduplicated by (reviewBody, product) before
-    being returned to the caller (runner.py), which POSTs them to the API.
-    """
+    """Sequential crawler. One instance per run; pass it a fresh `BankiruClient`."""
 
     def __init__(self, client: BankiruClient) -> None:
-        """Create a crawler with the given HTTP client.
-
-        Args:
-            client: A warmed-up BankiruClient instance (cookie jar seeded).
-        """
         self.client = client
-        # Accumulator for all review records across all products.
-        # Each record is a dict matching the API's Review schema.
-        self.records: list[dict] = []
+        self.records: list[dict[str, str]] = []
+        self.seen_review = False
+        self.saw_challenge = False
+        self.location_cache: dict[str, str] = {}
+        self.known_locations: dict[str, str] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.db_hits = 0
 
     async def crawl_all(
         self,
@@ -66,27 +243,13 @@ class BankiruCrawler:
         start_date: dt.datetime | None = None,
         end_date: dt.datetime | None = None,
         days: int = 1,
-    ) -> list[dict]:
-        """Crawl every product sequentially; return deduplicated records.
-
-        Parameters
-        ----------
-        start_date:
-            Explicit start of the date window (inclusive).
-            When ``None``, computed as ``today(tz) - relativedelta(days=days)``.
-        end_date:
-            Explicit end of the date window (exclusive).
-            When ``None``, defaults to ``today(tz)`` (midnight today).
-        days:
-            Fallback day offset used only when *start_date* is ``None``.
-        """
+    ) -> list[dict[str, str]]:
+        """Crawl every product sequentially; return deduplicated records."""
         tz = ZoneInfo(get_settings().PARSER_TIMEZONE)
         start_date = start_date or (today(tz) - relativedelta(days=days))
         end_date = end_date or today(tz)
 
-        # Ensure both boundaries are naive so they can be compared with
-        # date_published values parsed from banki.ru HTML (always naive,
-        # implicitly in PARSER_TIMEZONE).
+        # banki.ru stamps are naive and implicitly in PARSER_TIMEZONE.
         start_date = start_date.replace(tzinfo=None)
         end_date = end_date.replace(tzinfo=None)
 
@@ -94,208 +257,127 @@ class BankiruCrawler:
             "crawl_all start={start} end={end}",
             start=start_date.isoformat(), end=end_date.isoformat(),
         ):
-            for product in PRODUCTS:
-                await self._crawl_product(product, start_date, end_date)
+            self.seen_review = False
+            self.known_locations = await load_known_locations(start_date, end_date)
+            try:
+                for product in PRODUCTS:
+                    await self._crawl_product(product, start_date, end_date)
+                if not self.seen_review:
+                    if self.saw_challenge:
+                        raise ChallengePageError("challenge page")
+                    raise EmptyMarkupError("no review markup")
+                return self._deduplicated()
+            finally:
+                logger.info(
+                    "detail cache hits=%s misses=%s db_hits=%s",
+                    self.cache_hits,
+                    self.cache_misses,
+                    self.db_hits,
+                )
 
-        return self._deduplicated()
-
-    def _deduplicated(self) -> list[dict]:
-        """Remove duplicate reviews by (reviewBody, product) combination.
-
-        Duplicates can arise because:
-          - banki.ru uses both "corporate" and "legal" slugs for the same
-            product category (see settings.py PRODUCTS dict)
-          - A review may appear on multiple listing pages during pagination
-
-        Uses pandas for efficient deduplication on large record sets.
-        """
+    def _deduplicated(self) -> list[dict[str, str]]:
+        """Remove duplicate reviews by (reviewBody, product) combination."""
         if not self.records:
             return []
-        return (
+        rows: list[dict[str, str]] = (
             pd.DataFrame.from_records(self.records)
             .drop_duplicates(subset=["reviewBody", "product"])
             .to_dict(orient="records")
         )
+        return rows
 
-    # ── per-product loop ────────────────────────────────────────────────
     async def _crawl_product(
         self,
         product: str,
         start_date: dt.datetime,
         end_date: dt.datetime,
     ) -> None:
-        """Crawl all listing pages for a single product within the date window.
-
-        Pagination logic:
-          - Iterate pages 1, 2, 3, ... (infinite counter via itertools.count)
-          - For each page, extract review candidates within [start_date, end_date)
-          - For each candidate, fetch the detail page to get the author's city
-          - Stop when:
-            a) hit_left_boundary: found a review older than start_date
-               (reviews are sorted newest-first on banki.ru)
-            b) not any_matched: page has no review markup (past last page)
-            c) response is None: all retries exhausted for this page
-
-        Args:
-            product: URL slug for the product (e.g. "creditcards")
-            start_date: Inclusive start of the date window (naive datetime)
-            end_date: Exclusive end of the date window (naive datetime)
-        """
-        # Look up the human-readable product label (e.g. "Кредитная карта")
-        # for use in the final review record.
-        product_label = PRODUCTS[product]
-
         with logfire.span("crawl product={product}", product=product):
-            for page in itertools.count(1):
-                # Build the listing page URL with filters: type=all, rate=1&2
-                # (only negative reviews with ratings 1 or 2 out of 5).
-                url = PAGE_URL.format(base=BASE_URL, product=product, page=page)
-                response = await self.client.get(url, product=product)
-                if response is None:
-                    # All retries exhausted for this page — skip this product.
+            for rate in RATES:
+                if await self._crawl_rate(product, rate, start_date, end_date):
                     return
 
-                # Normalise whitespace and remove backslashes from the HTML.
-                # This simplifies regex matching in _extract_candidates().
-                page_text = " ".join(response.text.replace("\\", "").split())
-                candidates, hit_left_boundary, any_matched = self._extract_candidates(
-                    page_text, product, product_label, url, start_date, end_date,
-                )
-
-                # Fetch the detail page for each candidate to extract the
-                # author's city (location). This is done sequentially — one
-                # request at a time through the same pacing client.
-                for candidate in candidates:
-                    await self._enrich_one(candidate)
-
-                if hit_left_boundary:
-                    # Found a review older than start_date — we've passed the
-                    # left boundary of our date window. No need to paginate further.
-                    return
-
-                if not any_matched:
-                    # No review markup found on this page — we've gone past
-                    # the last listing page for this product.
-                    return
-                # any_matched=True but candidates=[] means all reviews on this
-                # page are newer than end_date; paginate forward to find the
-                # window reviews on the next page.
-
-    # ── extraction ──────────────────────────────────────────────────────
-    def _extract_candidates(
+    async def _crawl_rate(
         self,
-        page_text: str,
-        product_key: str,
-        product_label: str,
-        listing_url: str,
+        product: str,
+        rate: str,
         start_date: dt.datetime,
         end_date: dt.datetime,
-    ) -> tuple[list[dict], bool, bool]:
-        """Parse review candidates from a listing page.
-
-        Returns (candidates, hit_left_boundary, any_matched).
-
-        `any_matched` is False only when the page contains no review markup at
-        all — the reliable signal that we have gone past the last listing page.
-        Callers must not stop pagination merely because `candidates` is empty:
-        that can happen when all reviews on the page are newer than `end_date`
-        (e.g. a burst of today-reviews fills page 1) and the window reviews
-        are on the next page.
-        """
-        candidates: list[dict] = []
-        hit_left_boundary = False
-        any_matched = False
-
-        # Pair up content matches (JSON-LD structured data) with URL matches
-        # (review detail page links). Both regexes match in the same order
-        # on the page, so zip() correctly pairs them.
-        # Materialise iterators so we can compare counts before zipping.
-        # A mismatch means the page HTML changed or a regex missed a review;
-        # zip() would silently drop the extra matches without this check.
-        content_matches = list(REVIEW_CONTENT_PATTERN.finditer(page_text))
-        url_matches = list(REVIEW_URL_PATTERN.finditer(page_text))
-        if len(content_matches) != len(url_matches):
-            # Do not zip unequal lists — that would pair the wrong URL with a
-            # review body. Drop this page's pairs but keep any_matched=True so
-            # pagination does not treat the page as "past the last listing".
-            logfire.warning(
-                "Listing page match count mismatch: {content} content vs "
-                "{url} url — dropping page pairs to avoid misaligned rows",
-                content=len(content_matches),
-                url=len(url_matches),
+    ) -> bool:
+        for page in itertools.count(1):
+            url = PAGE_URL.format(
+                base=BASE_URL, product=product, page=page, rate=rate,
             )
-            return [], False, True
-
-        for content_match, url_match in zip(content_matches, url_matches):
-            any_matched = True
-            # Reconstruct the JSON-LD object from the regex capture groups.
-            # The regex captures only the parts we need (datePublished,
-            # reviewBody, itemReviewed.name), skipping author/rating fields.
-            # Malformed JSON on one review must not abort the whole page.
             try:
-                raw = json.loads("".join(content_match.groups()))
-            except json.JSONDecodeError as exc:
-                logfire.warning(
-                    "Skipping malformed review JSON-LD on listing page: {exc}",
-                    exc=str(exc),
+                response = await self.client.get(url, product=product, kind="listing")
+                if response is None:
+                    raise ListingFetchError(url)
+                records = parse_listing(response.text)
+                assert_rate(records, rate)
+            except RatingFilterMissed:
+                raise
+            except (ListingFetchError, ListingParseError) as exc:
+                logger.error(
+                    "parser product skipped: %s product=%s rate=%s url=%s",
+                    type(exc).__name__,
+                    product,
+                    rate,
+                    url,
                 )
-                continue
-            date_published = dt.datetime.strptime(
-                raw["datePublished"], "%Y-%m-%d %H:%M:%S"
-            )
-            # Reviews are sorted newest-first on banki.ru. Skip reviews
-            # newer than end_date (they're outside our window).
-            if date_published >= end_date:
-                continue
-            # If we hit a review older than start_date, we've passed the
-            # left boundary — all subsequent reviews will be even older.
-            if date_published < start_date:
-                hit_left_boundary = True
-                break
+                return False
+            except ChallengePageError:
+                self.saw_challenge = True
+                logger.error(
+                    "parser product skipped: ChallengePageError product=%s rate=%s url=%s",
+                    product,
+                    rate,
+                    url,
+                )
+                return True
+            if page == 1 and records:
+                self.seen_review = True
+            if not records:
+                return False
+            kept, hit_left = select_page(records, start_date, end_date)
+            for record in kept:
+                await self._enrich_one(record, product, url)
+            if hit_left:
+                return False
+        return False
 
-            # Store the candidate with internal metadata (prefixed with _)
-            # that will be consumed by _enrich_one() and then discarded.
-            candidates.append({
-                "_raw":         raw,
-                "_review_url":  BASE_URL + url_match.group(1),
-                "_listing_url": listing_url,
-                "_product_key":   product_key,
-                "_product_label": product_label,
-            })
-
-        return candidates, hit_left_boundary, any_matched
-
-    # ── detail enrichment ───────────────────────────────────────────────
-    async def _enrich_one(self, candidate: dict) -> None:
-        """Fetch the detail page for one review and append the finished record.
-
-        Uses the same sleep → request loop as listing pages. On success the
-        author's city is extracted; if all attempts fail ``location`` is stored
-        as an empty string so the review is never lost.
-        """
-        raw           = candidate["_raw"]
-        review_url    = candidate["_review_url"]
-        listing_url   = candidate["_listing_url"]
-        product_key   = candidate["_product_key"]
-        product_label = candidate["_product_label"]
-
-        response = await self.client.get(
-            review_url,
-            product=product_key,
-            extra_headers={"Referer": listing_url},
-        )
-
-        if response is not None:
-            m = LOC_PATTERN.search(response.text)
-            loc = m.group(1) if m else ""
+    async def _enrich_one(
+        self,
+        record: ParsedReview,
+        product: str,
+        listing_url: str,
+    ) -> None:
+        stored_url = BASE_URL + record.detail_path
+        if stored_url in self.known_locations:
+            self.db_hits += 1
+            location = self.known_locations[stored_url]
+        elif stored_url in self.location_cache:
+            self.cache_hits += 1
+            location = self.location_cache[stored_url]
         else:
-            loc = ""
-
-        self.records.append({
-            "datePublished": raw["datePublished"],
-            "reviewBody":    clean_text_pipe(raw["reviewBody"]),
-            "bankName":      raw["itemReviewed"]["name"].strip(),
-            "url":           review_url,
-            "location":      loc,
-            "product":       product_label,
-        })
+            self.cache_misses += 1
+            response = await self.client.get(
+                detail_request_url(stored_url),
+                product=product,
+                extra_headers={"Referer": listing_url},
+                kind="detail",
+            )
+            if response is None or is_challenge_page(response.text):
+                location = ""
+            else:
+                location = location_from_detail(response.text)
+                self.location_cache[stored_url] = location
+        self.records.append(
+            {
+                "datePublished": record.date_published.strftime("%Y-%m-%d %H:%M:%S"),
+                "reviewBody": clean_text_pipe(record.review_body),
+                "bankName": record.bank_name,
+                "url": stored_url,
+                "location": location,
+                "product": PRODUCTS[product],
+            }
+        )

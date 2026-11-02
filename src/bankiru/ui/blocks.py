@@ -108,7 +108,10 @@ async def get_reviews(
         # 1. Query the database, 2. Export to S3, 3. Run LLM summarization.
         async with httpx.AsyncClient(timeout=600.0) as http:
             try:
-                response = await http.get(settings.GET_REVIEWS_URL, params=params)
+                response = await http.get(
+                    settings.GET_REVIEWS_URL,
+                    params=params,  # type: ignore[arg-type]
+                )
                 response.raise_for_status()
                 body = response.json()
             except httpx.HTTPStatusError as exc:

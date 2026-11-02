@@ -283,7 +283,9 @@ class XlsxMaker(ScalarsHandler):
         # Reviews from the same URL get the same number, enabling
         # alternating-colour grouping in the spreadsheet.
         number = itertools.count(1)
-        enumerator = collections.defaultdict(lambda: next(number))
+        enumerator: collections.defaultdict[str, int] = collections.defaultdict(
+            lambda: next(number)
+        )
         # Map each URL to its group number, then determine odd/even.
         review_n = self.df.url.apply(lambda url: enumerator[url])
         odd_row_mask = (review_n % 2).astype(bool)
