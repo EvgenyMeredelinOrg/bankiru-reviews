@@ -1,6 +1,6 @@
 """UI FastAPI app: SessionMiddleware + ProxyHeaders + Authlib OIDC + Gradio mount.
 
-Security posture (see README "Security hardening"):
+Security posture (see docs/operations.md "Security hardening"):
   - OIDC `redirect_uri` pinned from config (not derived from request headers).
   - RP-initiated logout via the OIDC `end_session_endpoint`.
   - Session is rotated (`clear()`) before writing identity.

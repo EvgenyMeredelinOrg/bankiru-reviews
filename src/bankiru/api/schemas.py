@@ -135,7 +135,7 @@ class ReviewsQuery(BaseModel):
     location: list[str] | None = None  # filter by city prefix(es)
     product: list[str] | None = None   # filter by product label(s)
     keywords: str | None = None        # free-text semantic search query
-    outputFormat: outputFormats | None = None  # type: ignore[assignment]
+    outputFormat: outputFormats | None = None  # type: ignore[assignment, valid-type]
     summarize: bool = False            # omit → false on every path
     cloudModel: str | None = None      # LLM model when summarize is true
 

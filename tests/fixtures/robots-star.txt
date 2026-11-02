@@ -1,0 +1,15 @@
+User-agent: *
+Disallow: /services/responses/*&f[
+Disallow: /services/responses/*?f[
+Disallow: /services/responses/bank/response/*/comments/
+Disallow: */services/responses/bank/*/city/*/product/
+Disallow: */services/responses/bank/*/city/drugie/*
+Disallow: */services/responses/list/city/*/product/
+Disallow: */response/11767693*
+Disallow: *rate[]=*
+
+User-agent: bankiru-reviews
+Disallow: /private
+
+User-agent: Comparserbot
+Disallow: /

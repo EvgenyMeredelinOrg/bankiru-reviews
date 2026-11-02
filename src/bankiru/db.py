@@ -227,7 +227,7 @@ async def create_all_tables() -> None:
     # index exists by issuing CREATE INDEX IF NOT EXISTS for each one.
     # Disable statement_timeout for this block — index creation on a
     # large existing table can exceed the default 300 s limit.
-    indexes = list(Review.__table__.indexes)
+    indexes = list(Review.__table__.indexes)  # type: ignore[attr-defined]
     total = len(indexes)
     t0 = _time.monotonic()
     async with get_engine().begin() as conn:

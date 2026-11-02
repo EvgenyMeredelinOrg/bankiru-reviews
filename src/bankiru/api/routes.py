@@ -695,7 +695,7 @@ async def delete_reviews_by_date(
             Review.datePublished <= datetime.combine(end_date, time.max),
         )
         result = await session.execute(statement)
-        deleted = result.rowcount
+        deleted = result.rowcount  # type: ignore[attr-defined]
         await session.commit()
 
     logfire.info(
@@ -745,7 +745,7 @@ async def delete_duplicate_reviews(
             .where(Review.id.not_in(select(keep_ids.c.id)))
         )
         result = await session.execute(statement)
-        deleted = result.rowcount
+        deleted = result.rowcount  # type: ignore[attr-defined]
         await session.commit()
 
     logfire.info("deduplicated: {deleted} rows removed", deleted=deleted)

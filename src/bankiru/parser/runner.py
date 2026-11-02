@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import time
 
 import httpx
 import logfire
@@ -38,6 +39,13 @@ import logfire
 from bankiru.config import get_settings
 from bankiru.parser.client import BankiruClient
 from bankiru.parser.crawler import BankiruCrawler
+from bankiru.parser.errors import (
+    ChallengePageError,
+    CrawlDeadlineError,
+    EmptyMarkupError,
+    RobotsDenied,
+)
+from bankiru.parser.settings import USER_AGENT
 
 logger = logging.getLogger("bankiru.parser.runner")
 
@@ -85,12 +93,32 @@ async def run_once(
         crawl_kwargs["days"] = days
 
     with logfire.span("parser.run_once"):
+        run_deadline = time.monotonic() + settings.PARSER_RUN_DEADLINE_SEC
+        crawler = None
         try:
-            async with BankiruClient() as client:
+            async with BankiruClient(run_deadline=run_deadline) as client:
                 crawler = BankiruCrawler(client)
                 reviews = await crawler.crawl_all(**crawl_kwargs)
         except RuntimeError as exc:
             logfire.error("run aborted: {exc}", exc=str(exc))
+            return
+        except RobotsDenied as exc:
+            logger.error(
+                "parser run failed: RobotsDenied agent=%s rule=%s path=%s",
+                USER_AGENT,
+                exc.rule,
+                exc.path,
+            )
+            return
+        except CrawlDeadlineError:
+            reviews = crawler._deduplicated() if crawler is not None else []
+            logger.error("parser run failed: CrawlDeadlineError")
+            if reviews:
+                logfire.info("crawl complete: {n} reviews", n=len(reviews))
+                await _post_with_retry(settings.CREATE_REVIEWS_ENDPOINT, reviews, settings.API_TOKEN)
+            return
+        except (ChallengePageError, EmptyMarkupError) as exc:
+            logger.error("parser run failed: %s", type(exc).__name__)
             return
 
         logfire.info("crawl complete: {n} reviews", n=len(reviews))

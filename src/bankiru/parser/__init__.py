@@ -12,10 +12,10 @@
 #                  crawler, collects reviews, POSTs them to the API
 #   crawler.py   — sequential page-by-page crawler: iterates products, listing
 #                  pages, and detail pages within a date window
-#   client.py    — async HTTP client with randomised pacing and unlimited retry
-#                  on connect errors (ban-avoidance strategy)
+#   client.py    — async HTTP client with randomised pacing, a per-URL connect
+#                  budget, and a run deadline
 #   settings.py  — static constants: product catalog, URL templates, regex
-#                  patterns, User-Agent pool, and base HTTP headers
+#                  patterns, USER_AGENT, and base HTTP headers
 #   tools.py     — text cleaning pipeline: HTML tag removal, emoji stripping,
 #                  whitespace normalisation
 #
