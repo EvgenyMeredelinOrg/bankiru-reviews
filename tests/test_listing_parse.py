@@ -1,9 +1,12 @@
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
+from bankiru.parser.client import BankiruClient
 from bankiru.parser.crawler import (
+    BankiruCrawler,
     ParsedReview,
     is_challenge_page,
     listing_records,
@@ -93,3 +96,86 @@ def test_smoke_missing_stored_ignores_new_rows() -> None:
         ("https://www.banki.ru/lost", "Кредитная карта"),
     }
     assert smoke_missing_stored(collected, stored) == 1
+
+
+def _listing(rows: list[tuple[str, str, str, str]]) -> str:
+    blocks: list[str] = []
+    anchors: list[str] = []
+    for body, stamp, rating, rid in rows:
+        blocks.append(
+            "{"
+            '"@type":"Review",'
+            f'"datePublished":"{stamp}",'
+            f'"reviewBody":"{body}",'
+            f'"reviewRating":{{"ratingValue":"{rating}"}},'
+            '"itemReviewed":{"name":"Bank"}'
+            "}"
+        )
+        anchors.append(
+            f'<a href="/services/responses/bank/response/{rid}/" data-x="1">{rid}</a>'
+        )
+    return (
+        '<script type="application/ld+json">['
+        + ",".join(blocks)
+        + "]</script>"
+        + "".join(anchors)
+    )
+
+
+@pytest.mark.asyncio
+async def test_high_ratings_do_not_hide_a_later_low_rating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Page 1 is only a 5. Page 2 has a rating 1 inside the window, then an older review.
+
+    The rating 1 is stored. The review dated before start_date is not.
+    The run does not raise EmptyMarkupError.
+    """
+    monkeypatch.setattr(
+        "bankiru.parser.crawler.PRODUCTS",
+        {"creditcards": "Кредитная карта"},
+    )
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen.append(url)
+        if "page=1" in url:
+            return httpx.Response(
+                200,
+                text=_listing([("high only", "2026-10-31 18:00:00", "5", "501")]),
+            )
+        if "page=2" in url:
+            return httpx.Response(
+                200,
+                text=_listing(
+                    [
+                        ("low in window", "2026-10-31 08:00:00", "1", "101"),
+                        ("too old", "2026-10-30 12:00:00", "3", "301"),
+                    ]
+                ),
+            )
+        if "/response/101" in url:
+            return httpx.Response(200, text='<span class="l3a372298">Moscow</span>')
+        return httpx.Response(200, text="<html></html>")
+
+    async def sleep(_delay: float) -> None:
+        return None
+
+    client = BankiruClient(
+        transport=httpx.MockTransport(handler),
+        sleep=sleep,
+        now=lambda: 0.0,
+    )
+    client._robots = ()
+    rows = await BankiruCrawler(client).crawl_all(
+        start_date=datetime(2026, 10, 31),
+        end_date=datetime(2026, 11, 1),
+    )
+    assert [row["reviewBody"] for row in rows] == ["low in window"]
+    assert rows[0]["location"] == "Moscow"
+    assert rows[0]["product"] == "Кредитная карта"
+    assert any("page=2" in url for url in seen)
+    assert not any("page=3" in url for url in seen)
+    assert not any("/response/501" in url for url in seen)
+    assert not any("/response/301" in url for url in seen)

@@ -6,8 +6,10 @@ one. Every request goes through the same back-off client — there is no
 concurrency anywhere.
 
 A listing fetch or parse error ends that product. Other products still run,
-and a partial collection is still POSTed. Connect retries stop at the
-per-URL budget. The run itself stops at the deadline passed into the client.
+and a partial collection is still POSTed. A page with no Review objects ends
+the product. Other ratings are not stored, and their dates still decide when
+to stop. Connect retries stop at the per-URL budget. The run itself stops at
+the deadline passed into the client.
 """
 
 from __future__ import annotations
@@ -71,7 +73,8 @@ def _walk_reviews(node: object) -> list[dict[str, Any]]:
     return found
 
 
-def listing_records(html: str) -> list[ParsedReview]:
+def parse_listing(html: str) -> list[ParsedReview]:
+    """Return every Review on the page, in listing order, any rating."""
     if is_challenge_page(html):
         raise ChallengePageError("challenge page")
     reviews: list[dict[str, Any]] = []
@@ -102,7 +105,12 @@ def listing_records(html: str) -> list[ParsedReview]:
         if isinstance(rating_node, dict):
             rating = str(rating_node.get("ratingValue", ""))
         parsed.append(ParsedReview(body, stamp, bank, path, rating))
-    return [row for row in parsed if row.rating in {"1", "2"}]
+    return parsed
+
+
+def listing_records(html: str) -> list[ParsedReview]:
+    """Reviews with ratingValue 1 or 2. Pagination uses `parse_listing`."""
+    return [row for row in parse_listing(html) if row.rating in {"1", "2"}]
 
 
 def select_page(
@@ -190,7 +198,7 @@ class BankiruCrawler:
                     response = await self.client.get(url, product=product, kind="listing")
                     if response is None:
                         raise ListingFetchError(url)
-                    records = listing_records(response.text)
+                    records = parse_listing(response.text)
                 except (ListingFetchError, ListingParseError) as exc:
                     logger.error(
                         "parser product skipped: %s product=%s url=%s",
@@ -213,6 +221,8 @@ class BankiruCrawler:
                     return
                 kept, hit_left = select_page(records, start_date, end_date)
                 for record in kept:
+                    if record.rating not in {"1", "2"}:
+                        continue
                     await self._enrich_one(record, product, url)
                 if hit_left:
                     return

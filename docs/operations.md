@@ -259,9 +259,9 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 
 1. Fetch the listing page: `GET /services/responses/list/product/{slug}/?page={n}&type=all`. The URL has no `rate[]` parameters. `robots.txt` for `User-agent: *` disallows `*rate[]=*`. Ratings 1 and 2 are kept after parse.
 2. Read each `<script type="application/ld+json">` block with `json.loads` and walk objects whose `@type` is `Review`. Pair them in order with detail paths from `REVIEW_URL_PATTERN` (the path, with no trailing slash). Do not strip backslashes before `json.loads`. A count mismatch or a block that is not JSON raises `ListingParseError` and ends this product. Other products still run, and reviews already collected are still POSTed. A listing that is a challenge page (`__jhash_`, `__js_p_`, or `__jua_`) raises `ChallengePageError` and ends this product.
-3. Keep `ratingValue` 1 and 2 only. For each kept review in `[start_date, end_date)`, fetch the detail page and read the city from `<span class="l3a372298">…</span>` (`LOC_PATTERN`). A missing detail response, or a detail page that is a challenge, stores `location` as `""` and keeps the review.
-4. Dates on or after `end_date` are skipped and pagination continues. The first date before `start_date` stops the product and is not stored. A page that yields no rating 1 or 2 review ends the product. A page of only newer reviews does not.
-5. After all products, if no product's first page yielded a rating 1 or 2 review, the run raises `EmptyMarkupError`, or `ChallengePageError` when a challenge page was seen, and does not POST. A non-empty first page still counts when every review is newer than `end_date`: that night logs `no reviews collected; skipping POST` and does not log `parser run failed`. Otherwise deduplicate in-memory on `(reviewBody, product)` via pandas `drop_duplicates`.
+3. Walk every Review on the page, then store `ratingValue` 1 and 2 only. For each stored review in `[start_date, end_date)`, fetch the detail page and read the city from `<span class="l3a372298">…</span>` (`LOC_PATTERN`). A missing detail response, or a detail page that is a challenge, stores `location` as `""` and keeps the review.
+4. Dates on or after `end_date` are skipped and pagination continues. The first date before `start_date` stops the product and is not stored, whatever its rating. A page with no Review objects ends the product. A page of only ratings 3 to 5 does not, so a later page can still hold a rating 1 or 2. A page of only newer reviews does not end the product either.
+5. After all products, if no product's first page contained a Review object, the run raises `EmptyMarkupError`, or `ChallengePageError` when a challenge page was seen, and does not POST. A first page that has reviews still counts when none of them are stored: that night logs `no reviews collected; skipping POST` and does not log `parser run failed`. Otherwise deduplicate in-memory on `(reviewBody, product)` via pandas `drop_duplicates`.
 
 Warmup sleeps, sends `GET /` with `USER_AGENT`, sleeps again, and reads `https://www.banki.ru/robots.txt` once (at most 262144 characters). An unusable robots file raises `RobotsDenied` and logs `parser run failed: RobotsDenied` with no POST. A transport failure on the homepage logs `run aborted` and does not POST. A URL that robots disallows is not requested.
 
@@ -658,7 +658,7 @@ bankiru-reviews/
 │   ├── test_documented_messages.py # error texts and test names quoted in the docs stay in step
 │   ├── test_client_deadline.py     # connect budget; missing detail keeps an empty location
 │   ├── test_client_headers.py      # USER_AGENT on warmup, robots, and get; denied URL is not fetched
-│   ├── test_listing_parse.py       # JSON-LD reviews, ratings 1 and 2, date window, smoke diff
+│   ├── test_listing_parse.py       # JSON-LD; ratings 1 and 2 after the date walk; smoke diff
 │   ├── test_robots.py              # allow the plain listing and detail; deny rate[], ?f[, comments
 │   ├── test_summarizer_budget.py   # OUTPUT_TOKENS_LIMIT 8192
 │   └── test_trusted_hosts.py       # TRUSTED_HOSTS=172.16.89.1 parses as one item
@@ -895,6 +895,7 @@ service.
 | Detail response missing | `location` is empty and the review stays | `test_missing_detail_keeps_empty_location` |
 | `TRUSTED_HOSTS=172.16.89.1` | One host | `test_trusted_hosts_parses_gateway` |
 | Output cap 8192 against a 200000 context | Per-call output is 8192 | `test_output_budget_is_8192` |
+| Page 1 is only ratings 3 to 5, page 2 has a rating 1 inside the window | That rating 1 is stored. A review before `start_date` is not. No `EmptyMarkupError` | `test_high_ratings_do_not_hide_a_later_low_rating` |
 
 #### Documentation
 
