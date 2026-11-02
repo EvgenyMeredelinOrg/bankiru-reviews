@@ -229,6 +229,27 @@ async def test_challenge_on_rate_one_skips_rate_two() -> None:
 
 
 @pytest.mark.asyncio
+async def test_challenge_on_one_product_still_fetches_both_rates_of_the_next() -> None:
+    texts = [
+        "<html>__jhash_</html>",
+        listing_html([("201", "1", IN_WINDOW), ("202", "1", BEFORE)]),
+        CITY,
+        listing_html([("301", "2", IN_WINDOW), ("302", "2", BEFORE)]),
+        CITY,
+    ]
+    crawler, client = _crawler(texts)
+    await crawler._crawl_product("debitcards", START, END)
+    await crawler._crawl_product("hypothec", START, END)
+    debit = [url for url in client.urls if "/product/debitcards/" in url]
+    hypo = [url for url in client.urls if "/product/hypothec/" in url]
+    assert crawler.saw_challenge is True
+    assert debit and all("rate=1" in url for url in debit)
+    assert not any("rate=2" in url for url in debit)
+    assert any("rate=1" in url for url in hypo)
+    assert any("rate=2" in url for url in hypo)
+
+
+@pytest.mark.asyncio
 async def test_cache_line_is_logged_when_rating_filter_missed(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

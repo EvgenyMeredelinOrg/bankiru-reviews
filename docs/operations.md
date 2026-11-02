@@ -899,6 +899,7 @@ service.
 | `ListingParseError` on rate 1 | Rate 2 still runs | `test_listing_parse_error_on_rate_one_does_not_skip_rate_two` |
 | `RatingFilterMissed` on rate 1 | Not swallowed; rate 2 is not requested | `test_rating_filter_missed_is_not_swallowed` |
 | A challenge body on rate 1 | `saw_challenge` is set and rate 2 is not requested | `test_challenge_on_rate_one_skips_rate_two` |
+| A challenge on the first product | The next product still requests `rate=1` and `rate=2` | `test_challenge_on_one_product_still_fetches_both_rates_of_the_next` |
 | `RatingFilterMissed` leaves `crawl_all` | The cache line is still logged | `test_cache_line_is_logged_when_rating_filter_missed` |
 | Sibling product tags of one page | One passage, the first tag's label, both ids | `test_sibling_products_share_one_passage` |
 | The same url with two locations | Two passages | `test_different_location_is_a_second_passage` |

@@ -294,8 +294,7 @@ class BankiruCrawler:
     ) -> None:
         with logfire.span("crawl product={product}", product=product):
             for rate in RATES:
-                await self._crawl_rate(product, rate, start_date, end_date)
-                if self.saw_challenge:
+                if await self._crawl_rate(product, rate, start_date, end_date):
                     return
 
     async def _crawl_rate(
@@ -304,7 +303,7 @@ class BankiruCrawler:
         rate: str,
         start_date: dt.datetime,
         end_date: dt.datetime,
-    ) -> None:
+    ) -> bool:
         for page in itertools.count(1):
             url = PAGE_URL.format(
                 base=BASE_URL, product=product, page=page, rate=rate,
@@ -325,7 +324,7 @@ class BankiruCrawler:
                     rate,
                     url,
                 )
-                return
+                return False
             except ChallengePageError:
                 self.saw_challenge = True
                 logger.error(
@@ -334,16 +333,17 @@ class BankiruCrawler:
                     rate,
                     url,
                 )
-                return
+                return True
             if page == 1 and records:
                 self.seen_review = True
             if not records:
-                return
+                return False
             kept, hit_left = select_page(records, start_date, end_date)
             for record in kept:
                 await self._enrich_one(record, product, url)
             if hit_left:
-                return
+                return False
+        return False
 
     async def _enrich_one(
         self,
