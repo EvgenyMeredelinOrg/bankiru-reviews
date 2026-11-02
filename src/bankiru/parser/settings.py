@@ -67,14 +67,16 @@ BASE_URL = "https://www.banki.ru"
 #   {base}    — BASE_URL
 #   {product} — URL slug from PRODUCTS dict (e.g. "creditcards")
 #   {page}    — page number (1-based, incremented by the crawler)
+#   {rate}    — one of RATES ("1", then "2")
 # Query params:
 #   type=all — include all review types (not just "official responses").
-# Ratings 1 and 2 are kept after parse. The URL has no rate[] parameters:
-# robots.txt disallows *rate[]=*.
+# Each pass sends one of rate=1 and rate=2. *rate[]=* still denies the
+# bracket form. The indexed form rate[0] / rate%5B0%5D is not sent either.
 PAGE_URL = (
     "{base}/services/responses/list/product/{product}/"
-    "?page={page}&type=all"
+    "?page={page}&type=all&rate={rate}"
 )
+RATES = ("1", "2")
 
 # ── Regex patterns for HTML parsing ─────────────────────────────────────────
 # These patterns extract structured data from banki.ru's HTML pages.

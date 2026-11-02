@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time as _time
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, Sequence
 
 import httpx
 import logfire
@@ -85,6 +85,45 @@ def format_review_for_embedding(
     if loc:
         parts.append(loc)
     return f"{' | '.join(parts)}\n{review_body}"
+
+
+class EmbeddingRow(Protocol):
+    id: int
+    url: str
+    bankName: str
+    product: str
+    location: str
+    reviewBody: str
+
+
+def passages_for_new_rows(
+    rows: Sequence[EmbeddingRow],
+) -> tuple[list[str], list[list[int]]]:
+    """One passage per distinct (url, bank, location, body), first row's product.
+
+    Sibling product tags of one page share a vector. A different url is a
+    different review and keeps its own, even when the text matches.
+    """
+    groups: dict[tuple[str, str, str, str], list[int]] = {}
+    order: list[tuple[str, str, str, str]] = []
+    first_product: dict[tuple[str, str, str, str], str] = {}
+    for row in rows:
+        key = (row.url, row.bankName, row.location, row.reviewBody)
+        if key not in groups:
+            order.append(key)
+            groups[key] = []
+            first_product[key] = row.product
+        groups[key].append(row.id)
+    texts = [
+        format_review_for_embedding(
+            bank_name=key[1],
+            product=first_product[key],
+            location=key[2],
+            review_body=key[3],
+        )
+        for key in order
+    ]
+    return texts, [groups[key] for key in order]
 
 
 def _apply_embedding_mode(text: str, mode: Literal["query", "passage"]) -> str:

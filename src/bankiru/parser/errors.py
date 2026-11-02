@@ -23,3 +23,7 @@ class ListingFetchError(Exception):
 
 class CrawlDeadlineError(Exception):
     pass
+
+
+class RatingFilterMissed(Exception):
+    pass

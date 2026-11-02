@@ -43,6 +43,7 @@ from bankiru.parser.errors import (
     ChallengePageError,
     CrawlDeadlineError,
     EmptyMarkupError,
+    RatingFilterMissed,
     RobotsDenied,
 )
 from bankiru.parser.settings import USER_AGENT
@@ -117,7 +118,7 @@ async def run_once(
                 logfire.info("crawl complete: {n} reviews", n=len(reviews))
                 await _post_with_retry(settings.CREATE_REVIEWS_ENDPOINT, reviews, settings.API_TOKEN)
             return
-        except (ChallengePageError, EmptyMarkupError) as exc:
+        except (ChallengePageError, EmptyMarkupError, RatingFilterMissed) as exc:
             logger.error("parser run failed: %s", type(exc).__name__)
             return
 

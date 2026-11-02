@@ -104,7 +104,7 @@ No auth. Returns `{"status": "ok"}`. Used by Docker's `healthcheck`.
     "datePublished": "2025-01-15 14:32:00",
     "reviewBody": "Terrible service…",
     "bankName": "Сбербанк",
-    "url": "https://www.banki.ru/services/responses/bank/response/123456/",
+    "url": "https://www.banki.ru/services/responses/bank/response/123456",
     "location": "Москва",
     "product": "Кредитная карта"
   }
@@ -257,13 +257,13 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 
 **Crawl loop (per product):**
 
-1. Fetch the listing page: `GET /services/responses/list/product/{slug}/?page={n}&type=all`. The URL has no `rate[]` parameters. `robots.txt` for `User-agent: *` disallows `*rate[]=*`. Ratings 1 and 2 are kept after parse.
-2. Read each `<script type="application/ld+json">` block with `json.loads` and walk objects whose `@type` is `Review`. Pair them in order with detail paths from `REVIEW_URL_PATTERN` (the path, with no trailing slash). Do not strip backslashes before `json.loads`. A count mismatch or a block that is not JSON raises `ListingParseError` and ends this product. Other products still run, and reviews already collected are still POSTed. A listing that is a challenge page (`__jhash_`, `__js_p_`, or `__jua_`) raises `ChallengePageError` and ends this product.
-3. Walk every Review on the page, then store `ratingValue` 1 and 2 only. For each stored review in `[start_date, end_date)`, fetch the detail page and read the city from `<span class="l3a372298">…</span>` (`LOC_PATTERN`). A missing detail response, or a detail page that is a challenge, stores `location` as `""` and keeps the review.
-4. Dates on or after `end_date` are skipped and pagination continues. The first date before `start_date` stops the product and is not stored, whatever its rating. A page with no Review objects ends the product. A page of only ratings 3 to 5 does not, so a later page can still hold a rating 1 or 2. A page of only newer reviews does not end the product either.
-5. After all products, if no product's first page contained a Review object, the run raises `EmptyMarkupError`, or `ChallengePageError` when a challenge page was seen, and does not POST. A first page that has reviews still counts when none of them are stored: that night logs `no reviews collected; skipping POST` and does not log `parser run failed`. Otherwise deduplicate in-memory on `(reviewBody, product)` via pandas `drop_duplicates`.
+1. Each product is fetched as `GET /services/responses/list/product/{slug}/?page={n}&type=all&rate=1` and then the same URL with `rate=2`. Each pass stops on its own `start_date`. `User-agent: *` disallows `*rate[]=*`. The crawler does not send `rate[]`, `rate%5B%5D`, or `rate[0]`. A detail URL already resolved in this run reuses `location` and still stores a row under the product label. The request URL has a trailing slash. The stored `url` does not.
+2. Read each `<script type="application/ld+json">` block with `loads_listing_json` (`json.loads(..., strict=False)` after doubling every backslash that is not a valid JSON escape) and walk objects whose `@type` is `Review`. An `AggregateRating` node is not a Review. Pair Review nodes in order with detail paths from `REVIEW_URL_PATTERN` (the path, with no trailing slash). A count mismatch, or a block that is still not JSON after the repair, raises `ListingParseError` and ends that rate pass. The log line is `parser product skipped: … rate=%s`. The other rate still runs. Other products still run, and reviews already collected are still POSTed. A listing that is a challenge page (`__jhash_`, `__js_p_`, or `__jua_`) sets `saw_challenge`, logs the same skip with `rate=%s`, and does not start the other rate of that product. Later products still run.
+3. If any Review has `rating` other than the rate just requested, raise `RatingFilterMissed`. `run_once` logs `parser run failed: RatingFilterMissed` and does not POST. For each review `select_page` keeps, read the city from `<span class="l3a372298">…</span>` (`LOC_PATTERN`) unless the in-night cache or the date-window prefetch already has a location for that stored URL. A missing detail response, or a detail page that is a challenge, stores `location` as `""` and is not reused. A real 200 with no span caches `""`. The row is still appended under the product label. At the start of `crawl_all`, one `SELECT url, location` reads rows with `datePublished` in `[start_date, end_date)`. A url is reused only when every row in that window has the same non-empty location. A prefetch failure logs the exception class and continues with an empty map.
+4. Dates on or after `end_date` are skipped and pagination continues. The first date before `start_date` stops that rate pass and is not stored. An empty Review list ends that rate pass only. The other rate still runs. `seen_review` is set when page 1 of a pass has any Review, before `select_page`.
+5. After all products, if no pass's first page contained a Review object, the run raises `EmptyMarkupError`, or `ChallengePageError` when a challenge page was seen, and does not POST. A first page that has reviews still counts when none of them are stored: that night logs `no reviews collected; skipping POST` and does not log `parser run failed`. Otherwise deduplicate in-memory on `(reviewBody, product)` via pandas `drop_duplicates`. `crawl_all` logs `detail cache hits=%s misses=%s db_hits=%s` from a `finally`, including when the run fails.
 
-Warmup sleeps, sends `GET /` with `USER_AGENT`, sleeps again, and reads `https://www.banki.ru/robots.txt` once (at most 262144 characters). An unusable robots file raises `RobotsDenied` and logs `parser run failed: RobotsDenied` with no POST. A transport failure on the homepage logs `run aborted` and does not POST. A URL that robots disallows is not requested.
+Warmup sleeps, sends `GET /` with `USER_AGENT`, sleeps again, and reads `https://www.banki.ru/robots.txt` once (at most 262144 characters). An unusable robots file raises `RobotsDenied` and logs `parser run failed: RobotsDenied` with no POST. A transport failure on the homepage logs `run aborted` and does not POST. A URL that robots disallows is not requested. A redirect whose target is disallowed raises `RobotsDenied` inside the response hook and is not followed. `run_once` logs `parser run failed: RobotsDenied agent=%s rule=%s path=%s` and does not POST.
 
 **Date window:** `start_date = today(tz) - relativedelta(days=PARSER_DAYS)`, `end_date = today(tz)`, where `tz = ZoneInfo(PARSER_TIMEZONE)`. Both anchored at 00:00:00 in the configured timezone (via `dateutil.utils.today(tz)`), so the window is `[yesterday 00:00:00, today 00:00:00)` in `PARSER_TIMEZONE` time. This ensures the date window matches the cron schedule's timezone regardless of the container's system clock.
 
@@ -323,7 +323,7 @@ A `ConnectTimeout` is classified as a probable WAF ban and retries with exponent
 
 | Setting | Default | Effect |
 |---------|---------|--------|
-| `PARSER_MAX_RETRIES` | `5` | Max non-connect failures (non-200 status, read timeout, etc.) per URL before the request is abandoned. A listing then raises `ListingFetchError` and ends that product. A detail returns `None`, and the review is stored with an empty location. |
+| `PARSER_MAX_RETRIES` | `5` | Max non-connect failures (non-200 status, read timeout, etc.) per URL before the request is abandoned. A listing then raises `ListingFetchError` and ends that rate pass. The other rate still runs. A detail returns `None`, and the review is stored with an empty location. |
 | `PARSER_BAN_PAUSE_MAX` | `300.0` s | Ceiling for the exponential back-off pause during a connect-error streak (probable WAF ban). |
 
 **Connect-error back-off formula:**
@@ -342,7 +342,7 @@ delay = min(base × jitter, BAN_PAUSE_MAX)       # jitter ∈ [0.5, 1.5)
 | 5 | min(20 × 16, 300) = 300 s | 150 – 300 s |
 | 6+ | 300 s (capped) | 150 – 300 s |
 
-Connect retries stop at `PARSER_CONNECT_RETRY_BUDGET_SEC` (900 seconds) for that URL and at `PARSER_RUN_DEADLINE_SEC` (21600 seconds) for the run. Past the per-URL budget, a listing raises `ListingFetchError` and that product ends. A detail returns `None`. A `CrawlDeadlineError` logs `parser run failed: CrawlDeadlineError` and POSTs the reviews already collected.
+Connect retries stop at `PARSER_CONNECT_RETRY_BUDGET_SEC` (900 seconds) for that URL and at `PARSER_RUN_DEADLINE_SEC` (21600 seconds) for the run. Past the per-URL budget, a listing raises `ListingFetchError` and that rate pass ends. The other rate still runs. A detail returns `None`. A `CrawlDeadlineError` logs `parser run failed: CrawlDeadlineError` and POSTs the reviews already collected.
 
 <a id="putting-it-all-together-a-concrete-example"></a>
 ### Putting it all together — a concrete example · [↑](#toc)
@@ -357,17 +357,7 @@ read:     ~0.5 s           (typical listing page)
 total:    ~15.6 s per request  →  ~4 req/min
 ```
 
-A daily run with `PARSER_DAYS=1` typically processes ~300–500 reviews across 24 products. Each product requires 1–5 listing pages + 1 detail page per review. For 400 reviews with ~100 listing pages:
-
-```
-warmup:          1 request  ×  ~15 s  =    15 s
-listing pages: 100 requests ×  ~15 s  = 1 500 s  (25 min)
-detail pages:  400 requests ×  ~15 s  = 6 000 s  (100 min)
-──────────────────────────────────────────────────────────
-total:         501 requests ×  ~15 s  ≈ 2.1 hours
-```
-
-Completed runs from 18 Oct through 31 Oct 2026 took 2h 02m to 4h 16m for 386 to 845 reviews, median 3h 36m, at `PARSER_SLEEP_MIN=10` and `PARSER_SLEEP_MAX=20`.
+A daily run with `PARSER_DAYS=1` typically processes ~300–500 reviews across 24 products. Each product is two rating passes. A detail page is fetched once per canonical URL per run, unless the window prefetch already has a location. Repeat detail URLs in the same run are not fetched again, and those hits do not sleep. Completed runs of the previous crawler, from 18 Oct through 31 Oct 2026, took 2h 02m to 4h 16m for 386 to 845 reviews, median 3h 36m, at `PARSER_SLEEP_MIN=10` and `PARSER_SLEEP_MAX=20`. Those runs fetched each kept row's detail page once per product label.
 
 <a id="post-batch-delivery"></a>
 ### POST batch delivery · [↑](#toc)
@@ -388,7 +378,7 @@ The POST retries with exponential back-off capped at 60 s, up to **20 attempts**
 
 **Warmup:** On `BankiruClient.__aenter__`, the client sleeps, fetches `GET /` with `USER_AGENT` and `ACCEPT_LANGUAGE`, sleeps again, and fetches `https://www.banki.ru/robots.txt` once. A homepage transport error logs `run aborted` and returns without a POST. An unusable robots body logs `parser run failed: RobotsDenied` and returns without a POST. Those two lines stay separate.
 
-**Typical run time:** Completed runs from 18 Oct through 31 Oct 2026 took 2h 02m to 4h 16m for 386 to 845 reviews, median 3h 36m, at `PARSER_SLEEP_MIN=10` and `PARSER_SLEEP_MAX=20`.
+**Typical run time:** Completed runs of the previous crawler, from 18 Oct through 31 Oct 2026, took 2h 02m to 4h 16m for 386 to 845 reviews, median 3h 36m, at `PARSER_SLEEP_MIN=10` and `PARSER_SLEEP_MAX=20`. Those runs requested each detail page once per product label.
 
 ---
 
@@ -466,7 +456,7 @@ When Semantic search is empty (including whitespace-only `keywords`), the query 
 <a id="embedding-pipeline"></a>
 ### Embedding pipeline · [↑](#toc)
 
-- **New reviews:** Embedded inline during `POST /reviews` using enriched passage text. If embedding fails, the review is saved without an embedding and will be backfilled later.
+- **New reviews:** Embedded inline during `POST /reviews` using enriched passage text. Rows inserted in that request that share `url`, `bankName`, `location`, and `reviewBody` share one vector. The passage uses the first row's product label. Historical vectors are not rewritten. If embedding fails, the review is saved without an embedding and will be backfilled later. Backfill still embeds one row at a time.
 - **Startup backfill:** At API startup, a background task embeds any reviews that don't yet have embeddings. A batch that fails repeatedly is skipped for the rest of that run (avoiding an infinite loop); those rows are retried on the next restart or via the CLI.
 - **Reindex CLI:** `python -m bankiru.embedder reindex --confirm` regenerates all embeddings from scratch (required after changing embedding format or model). The embedder is a **CLI module**, not a long-lived Compose service — run it with `docker exec bankiru-api`.
 - **Build-index CLI:** `python -m bankiru.embedder build-index` creates the HNSW index on existing embeddings only (no re-embed). Use when vectors are present but the index is missing or invalid (~15–45+ min for ~380K rows). API startup also calls this via `ensure_hnsw_index()` and **blocks until the index is ready**.
@@ -657,9 +647,11 @@ bankiru-reviews/
 │   ├── test_ui_errors.py           # gr.Error toasts, Download info toast, failure cleanup
 │   ├── test_documented_messages.py # error texts and test names quoted in the docs stay in step
 │   ├── test_client_deadline.py     # connect budget; missing detail keeps an empty location
-│   ├── test_client_headers.py      # USER_AGENT on warmup, robots, and get; denied URL is not fetched
-│   ├── test_listing_parse.py       # JSON-LD; ratings 1 and 2 after the date walk; smoke diff
-│   ├── test_robots.py              # allow the plain listing and detail; deny rate[], ?f[, comments
+│   ├── test_client_headers.py      # USER_AGENT on warmup, robots, and get; denied URL and denied redirect are not followed
+│   ├── test_detail_cache.py        # in-night location cache, window prefetch, two rate passes
+│   ├── test_embed_groups.py        # one passage per (url, bank, location, body)
+│   ├── test_listing_parse.py       # JSON-LD repair; assert_rate; ratings 1 and 2; smoke diff
+│   ├── test_robots.py              # longer group does not inherit *rate[]=*; a * group denies rate[]
 │   ├── test_summarizer_budget.py   # OUTPUT_TOKENS_LIMIT 8192
 │   └── test_trusted_hosts.py       # TRUSTED_HOSTS=172.16.89.1 parses as one item
 └── src/bankiru/
@@ -684,13 +676,13 @@ bankiru-reviews/
     ├── parser/
     │   ├── __main__.py             # APScheduler entry; SIGHUP live reschedule
     │   ├── runner.py               # run_once(days=N); POST with capped retry
-    │   ├── crawler.py              # BankiruCrawler; product/page/detail loop
+    │   ├── crawler.py              # two rate passes; location cache; window prefetch
     │   ├── client.py               # BankiruClient; randomised pacing; connect budget 900s; run deadline 21600s
     │   ├── challenge.py            # is_challenge_page (__jhash_, __js_p_, __jua_)
     │   ├── robots.py               # robots.txt groups; longest User-Agent prefix
-    │   ├── errors.py               # ListingParseError, RobotsDenied, CrawlDeadlineError
+    │   ├── errors.py               # ListingParseError, RatingFilterMissed, RobotsDenied, CrawlDeadlineError
     │   ├── smoke.py                # crawl_all against stored rows; no POST
-    │   ├── settings.py             # PRODUCTS; PAGE_URL without rate[]; USER_AGENT
+    │   ├── settings.py             # PRODUCTS; PAGE_URL with one rate per pass; USER_AGENT
     │   └── tools.py                # clean_text_pipe (double strip-tags → emoji → strip)
     └── ui/
         ├── __main__.py             # uvicorn entry; auto-traces ui.app + ui.blocks
@@ -872,7 +864,7 @@ service.
 | 200 without a URL | No info toast — there is nothing to download | `test_no_toast_without_a_url` |
 | Any failed Submit | The `.failure` listener clears the stale URL and Summary | `test_failure_handler_clears_url_and_summary` |
 
-#### Layer 7 — parser, robots, and budgets · `tests/test_listing_parse.py`, `tests/test_robots.py`, `tests/test_client_headers.py`, `tests/test_client_deadline.py`, `tests/test_trusted_hosts.py`, `tests/test_summarizer_budget.py`
+#### Layer 7 — parser, robots, and budgets · `tests/test_listing_parse.py`, `tests/test_robots.py`, `tests/test_client_headers.py`, `tests/test_client_deadline.py`, `tests/test_detail_cache.py`, `tests/test_embed_groups.py`, `tests/test_trusted_hosts.py`, `tests/test_summarizer_budget.py`
 
 | Condition | Outcome | Test |
 |-----------|---------|------|
@@ -883,19 +875,46 @@ service.
 | Review count differs from detail anchors | `ListingParseError` | `test_unequal_counts_raise` |
 | Every review is on or after `end_date` | `hit_left` is false and nothing is kept | `test_page_newer_than_window_continues` |
 | The next review is before `start_date` | That review is not stored and `hit_left` is true | `test_page_stops_at_older_review` |
+| A bad backslash before Cyrillic | `json.loads` fails; the repair keeps the character | `test_backslash_before_cyrillic` |
+| A valid escape, then a bad one | Both backslashes survive | `test_valid_pair_then_bad_escape` |
+| Three backslashes before Cyrillic | The repair doubles only the invalid one | `test_three_backslashes_before_cyrillic` |
+| A short `\u12` | Doubled, then parsed | `test_short_unicode_escape_is_doubled` |
+| `\u0041` | Kept, and parses as `A` | `test_four_hex_unicode_escape_is_kept` |
+| Valid JSON | The repair leaves the source unchanged | `test_valid_json_is_unchanged` |
+| A raw newline inside a string | `strict=False` accepts it | `test_raw_newline_parses` |
+| A trailing backslash | Doubled, and still `ListingParseError` | `test_trailing_backslash_is_doubled_and_still_invalid` |
+| 25 reviews of the requested rating | `assert_rate` does not raise | `test_requested_rating_does_not_raise` |
+| A Review rated 5, or the other of 1 and 2, or `"1.0"` | `RatingFilterMissed` | `test_other_rating_raises_rating_filter_missed` |
+| An `AggregateRating` of 5 plus 25 Reviews of the requested rating | `parse_listing` returns 25 and `assert_rate` does not raise | `test_aggregate_rating_is_not_a_review` |
 | Smoke diff | A new collected row is not missing; a stored row absent from the crawl is | `test_smoke_missing_stored_ignores_new_rows` |
+| The same canonical detail path under two products | One detail GET, slash on the request, no slash on the stored `url`, `cache_hits == 1` | `test_second_product_reuses_location` |
+| First detail response is `None` | Not cached; the next product GETs again | `test_none_detail_is_not_cached` |
+| First detail response is a challenge | Not cached; the next product GETs again | `test_challenge_detail_is_fetched_again` |
+| A 200 with no location span | Cached as `""`; the next product does not GET | `test_missing_span_is_cached_as_empty` |
+| `known_locations` already has the URL | No GET, `db_hits == 2`, both rows stored | `test_known_locations_skip_the_get_and_still_store_rows` |
+| Two locations, or one empty location, for one url | `collapse_locations` omits it; two copies of one non-empty location are kept | `test_collapse_locations_keeps_only_one_non_empty` |
+| `get_session_maker` raises | `load_known_locations` returns `{}` and logs the exception class | `test_load_known_locations_swallows_session_errors` |
+| Rate 1's second review is before `start_date` | Rate 2 is still requested and rate 1's kept row stays | `test_rate_one_stops_on_start_date_and_rate_two_still_runs` |
+| An empty rate-2 page | That pass ends; rate 1's rows stay | `test_empty_rate_two_page_leaves_rate_one_rows` |
+| `ListingParseError` on rate 1 | Rate 2 still runs | `test_listing_parse_error_on_rate_one_does_not_skip_rate_two` |
+| `RatingFilterMissed` on rate 1 | Not swallowed; rate 2 is not requested | `test_rating_filter_missed_is_not_swallowed` |
+| A challenge body on rate 1 | `saw_challenge` is set and rate 2 is not requested | `test_challenge_on_rate_one_skips_rate_two` |
+| `RatingFilterMissed` leaves `crawl_all` | The cache line is still logged | `test_cache_line_is_logged_when_rating_filter_missed` |
+| Sibling product tags of one page | One passage, the first tag's label, both ids | `test_sibling_products_share_one_passage` |
+| The same url with two locations | Two passages | `test_different_location_is_a_second_passage` |
 | Listing URL without `rate[]`, and the detail URL | Allowed for `USER_AGENT` | `test_listing_and_detail_allowed` |
-| A `rate[]` query | Denied by `*rate[]=*` | `test_rate_query_is_denied_and_plain_listing_is_allowed` |
-| `?f[` or a comments URL | Denied | `test_filter_query_and_comments_denied` |
+| `rate[]` against `robots-star.txt` for `USER_AGENT` | The longer `bankiru-reviews` group wins and does not inherit `*rate[]=*` | `test_longer_group_does_not_inherit_star_rules` |
+| `rate[]` and `rate%5B%5D` against a `*` group | Denied. A single `rate=1` or `rate=2` is allowed | `test_star_group_denies_bracket_and_allows_single_rate` |
+| `?f[` or a comments URL | Denied for an agent that matches only `*`. `USER_AGENT` on `robots-star.txt` does not inherit those rules | `test_filter_query_and_comments_denied` |
 | `User-agent: bankiru-reviews` and `/private` | The longer prefix wins | `test_specific_agent_beats_star` |
 | `Comparserbot` with `Disallow: /` | Does not apply to `USER_AGENT` | `test_comparserbot_rule_does_not_apply` |
 | Identity headers | `USER_AGENT` and `ACCEPT_LANGUAGE` | `test_identity_headers` |
 | A disallowed URL | No HTTP call | `test_disallow_does_not_call_transport` |
+| A 302 to a `rate[]` URL | `RobotsDenied` leaves `get`. The redirect is not followed | `test_denied_redirect_is_not_followed` |
 | Connect errors inside a 1 second budget | The listing stops; the detail returns `None` | `test_listing_connect_errors_stop_inside_a_short_budget`, `test_detail_connect_budget_returns_none` |
 | Detail response missing | `location` is empty and the review stays | `test_missing_detail_keeps_empty_location` |
 | `TRUSTED_HOSTS=172.16.89.1` | One host | `test_trusted_hosts_parses_gateway` |
 | Output cap 8192 against a 200000 context | Per-call output is 8192 | `test_output_budget_is_8192` |
-| Page 1 is only ratings 3 to 5, page 2 has a rating 1 inside the window | That rating 1 is stored. A review before `start_date` is not. No `EmptyMarkupError` | `test_high_ratings_do_not_hide_a_later_low_rating` |
 
 #### Documentation
 

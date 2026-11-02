@@ -86,6 +86,7 @@ class BankiruClient:
             max_keepalive_connections=0,
             keepalive_expiry=0,
         )
+        hooks: dict[str, list] = {"response": [self._refuse_denied_redirect]}
         if transport is None:
             self._client = httpx.AsyncClient(
                 http2=False,
@@ -93,6 +94,7 @@ class BankiruClient:
                 follow_redirects=True,
                 limits=limits,
                 headers=BASE_HEADERS,
+                event_hooks=hooks,
             )
         else:
             self._client = httpx.AsyncClient(
@@ -102,6 +104,7 @@ class BankiruClient:
                 limits=limits,
                 headers=BASE_HEADERS,
                 transport=transport,
+                event_hooks=hooks,
             )
 
     def _identity_headers(self) -> dict[str, str]:
@@ -172,6 +175,13 @@ class BankiruClient:
         denied = matching_disallow(self._robots, url, USER_AGENT)
         if denied is not None:
             raise RobotsDenied(denied, path)
+
+    async def _refuse_denied_redirect(self, response: httpx.Response) -> None:
+        if not response.has_redirect_location:
+            return
+        location = response.headers["location"]
+        target = str(response.url.join(location))
+        self._check_robots(target)
 
     async def get(
         self,

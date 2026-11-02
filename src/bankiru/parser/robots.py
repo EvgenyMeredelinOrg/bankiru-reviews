@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 @dataclass(frozen=True)
@@ -74,8 +74,9 @@ def matching_disallow(
     user_agent: str,
 ) -> str | None:
     split = urlsplit(url)
-    target = split.path + (f"?{split.query}" if split.query else "")
-    ranked: list[tuple[int, RobotsGroup]] = []
+    target = unquote(split.path + (f"?{split.query}" if split.query else ""))
+    chosen: RobotsGroup | None = None
+    chosen_rank: int | None = None
     ua = user_agent.lower()
     for group in groups:
         rank: int | None = None
@@ -91,16 +92,17 @@ def matching_disallow(
                 rank = this
         if rank is None:
             continue
-        ranked.append((rank, group))
-    # Longest User-Agent prefix wins. A specific group that does not match
-    # this path does not hide the `*` rules: the fixture allows the plain
-    # listing and still denies `*rate[]=*`, `?f[`, and `/comments/`.
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    for _rank, group in ranked:
-        best = _best_rule(group.rules, target)
-        if best is None:
+        if chosen_rank is None or rank > chosen_rank:
+            chosen = group
+            chosen_rank = rank
+    best: RobotsRule | None = None
+    for rule in (chosen.rules if chosen is not None else ()):
+        if not _matches(rule.path, target):
             continue
-        if best.directive == "allow" or best.path == "":
-            return None
-        return best.path
-    return None
+        if best is None or len(rule.path) > len(best.path):
+            best = rule
+        elif len(rule.path) == len(best.path) and rule.directive == "allow":
+            best = rule
+    if best is None or best.directive == "allow" or best.path == "":
+        return None
+    return best.path

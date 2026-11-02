@@ -1,18 +1,20 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
-import httpx
 import pytest
 
-from bankiru.parser.client import BankiruClient
 from bankiru.parser.crawler import (
-    BankiruCrawler,
     ParsedReview,
+    assert_rate,
     is_challenge_page,
     listing_records,
+    loads_listing_json,
+    parse_listing,
+    repair_json_escapes,
     select_page,
 )
-from bankiru.parser.errors import ChallengePageError, ListingParseError
+from bankiru.parser.errors import ChallengePageError, ListingParseError, RatingFilterMissed
 from bankiru.parser.smoke import smoke_missing_stored
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -122,60 +124,88 @@ def _listing(rows: list[tuple[str, str, str, str]]) -> str:
     )
 
 
-@pytest.mark.asyncio
-async def test_high_ratings_do_not_hide_a_later_low_rating(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Page 1 is only a 5. Page 2 has a rating 1 inside the window, then an older review.
+def test_backslash_before_cyrillic() -> None:
+    raw = '{"a":"\\д"}'
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)
+    assert loads_listing_json(raw) == {"a": "\\д"}
 
-    The rating 1 is stored. The review dated before start_date is not.
-    The run does not raise EmptyMarkupError.
-    """
-    monkeypatch.setattr(
-        "bankiru.parser.crawler.PRODUCTS",
-        {"creditcards": "Кредитная карта"},
+
+def test_valid_pair_then_bad_escape() -> None:
+    # Source text is {"a":"\\д\д"}: a valid pair, then a bad one.
+    raw = '{"a":"\\\\д\\д"}'
+    assert loads_listing_json(raw) == {"a": "\\д\\д"}
+
+
+def test_three_backslashes_before_cyrillic() -> None:
+    raw = '{"a":"\\\\\\д"}'
+    assert loads_listing_json(raw) == {"a": "\\\\д"}
+
+
+def test_short_unicode_escape_is_doubled() -> None:
+    raw = '{"a":"\\u12"}'
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)
+    assert loads_listing_json(raw) == {"a": "\\u12"}
+
+
+def test_four_hex_unicode_escape_is_kept() -> None:
+    raw = '{"a":"\\u0041"}'
+    assert repair_json_escapes(raw) == raw
+    assert loads_listing_json(raw) == {"a": "A"}
+
+
+def test_valid_json_is_unchanged() -> None:
+    raw = '{"a":"line\\n\\"quote\\" \\\\ slash\\/ \\u0041"}'
+    assert repair_json_escapes(raw) == raw
+    assert loads_listing_json(raw) == {"a": "line\n\"quote\" \\ slash/ A"}
+
+
+def test_raw_newline_parses() -> None:
+    raw = '{"reviewBody":"one\ntwo"}'
+    assert repair_json_escapes(raw) == raw
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)
+    assert loads_listing_json(raw) == {"reviewBody": "one\ntwo"}
+
+
+def test_trailing_backslash_is_doubled_and_still_invalid() -> None:
+    raw = '{"a":"abc\\'
+    assert repair_json_escapes(raw) == '{"a":"abc\\\\'
+    with pytest.raises(ListingParseError):
+        loads_listing_json(raw)
+
+
+def test_requested_rating_does_not_raise() -> None:
+    rows = [
+        ("body", "2026-11-01 12:00:00", "1", str(i))
+        for i in range(25)
+    ]
+    parsed = parse_listing(_listing(rows))
+    assert len(parsed) == 25
+    assert_rate(parsed, "1")
+
+
+def test_other_rating_raises_rating_filter_missed() -> None:
+    five = parse_listing(_listing([("body", "2026-11-01 12:00:00", "5", "1")]))
+    other = parse_listing(_listing([("body", "2026-11-01 12:00:00", "2", "1")]))
+    with pytest.raises(RatingFilterMissed):
+        assert_rate(five, "1")
+    with pytest.raises(RatingFilterMissed):
+        assert_rate(other, "1")
+    dotted = ParsedReview("b", datetime(2026, 11, 1), "Bank", "/p", "1.0")
+    with pytest.raises(RatingFilterMissed):
+        assert_rate([dotted], "1")
+
+
+def test_aggregate_rating_is_not_a_review() -> None:
+    rows = [("body", "2026-11-01 12:00:00", "1", str(i)) for i in range(25)]
+    html = (
+        '<script type="application/ld+json">'
+        '{"@type":"AggregateRating","ratingValue":5}'
+        "</script>"
+        + _listing(rows)
     )
-    seen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        seen.append(url)
-        if "page=1" in url:
-            return httpx.Response(
-                200,
-                text=_listing([("high only", "2026-10-31 18:00:00", "5", "501")]),
-            )
-        if "page=2" in url:
-            return httpx.Response(
-                200,
-                text=_listing(
-                    [
-                        ("low in window", "2026-10-31 08:00:00", "1", "101"),
-                        ("too old", "2026-10-30 12:00:00", "3", "301"),
-                    ]
-                ),
-            )
-        if "/response/101" in url:
-            return httpx.Response(200, text='<span class="l3a372298">Moscow</span>')
-        return httpx.Response(200, text="<html></html>")
-
-    async def sleep(_delay: float) -> None:
-        return None
-
-    client = BankiruClient(
-        transport=httpx.MockTransport(handler),
-        sleep=sleep,
-        now=lambda: 0.0,
-    )
-    client._robots = ()
-    rows = await BankiruCrawler(client).crawl_all(
-        start_date=datetime(2026, 10, 31),
-        end_date=datetime(2026, 11, 1),
-    )
-    assert [row["reviewBody"] for row in rows] == ["low in window"]
-    assert rows[0]["location"] == "Moscow"
-    assert rows[0]["product"] == "Кредитная карта"
-    assert any("page=2" in url for url in seen)
-    assert not any("page=3" in url for url in seen)
-    assert not any("/response/501" in url for url in seen)
-    assert not any("/response/301" in url for url in seen)
+    parsed = parse_listing(html)
+    assert len(parsed) == 25
+    assert_rate(parsed, "1")

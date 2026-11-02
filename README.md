@@ -149,9 +149,11 @@ bankiru-reviews/
 │   ├── test_ui_errors.py           # gr.Error toasts, Download info toast, failure cleanup
 │   ├── test_documented_messages.py # error texts and test names quoted in the docs stay in step
 │   ├── test_client_deadline.py     # connect budget; missing detail keeps an empty location
-│   ├── test_client_headers.py      # USER_AGENT on warmup, robots, and get; denied URL is not fetched
-│   ├── test_listing_parse.py       # JSON-LD; ratings 1 and 2 after the date walk; smoke diff
-│   ├── test_robots.py              # allow the plain listing and detail; deny rate[], ?f[, comments
+│   ├── test_client_headers.py      # USER_AGENT on warmup, robots, and get; denied URL and denied redirect are not followed
+│   ├── test_detail_cache.py        # in-night location cache, window prefetch, two rate passes
+│   ├── test_embed_groups.py        # one passage per (url, bank, location, body)
+│   ├── test_listing_parse.py       # JSON-LD repair; assert_rate; ratings 1 and 2; smoke diff
+│   ├── test_robots.py              # longer group does not inherit *rate[]=*; a * group denies rate[]
 │   ├── test_summarizer_budget.py   # OUTPUT_TOKENS_LIMIT 8192
 │   └── test_trusted_hosts.py       # TRUSTED_HOSTS=172.16.89.1 parses as one item
 └── src/bankiru/
@@ -176,13 +178,13 @@ bankiru-reviews/
     ├── parser/
     │   ├── __main__.py             # APScheduler entry; SIGHUP live reschedule
     │   ├── runner.py               # run_once(days=N); POST with capped retry
-    │   ├── crawler.py              # BankiruCrawler; product/page/detail loop
+    │   ├── crawler.py              # two rate passes; location cache; window prefetch
     │   ├── client.py               # BankiruClient; randomised pacing; connect budget 900s; run deadline 21600s
     │   ├── challenge.py            # is_challenge_page (__jhash_, __js_p_, __jua_)
     │   ├── robots.py               # robots.txt groups; longest User-Agent prefix
-    │   ├── errors.py               # ListingParseError, RobotsDenied, CrawlDeadlineError
+    │   ├── errors.py               # ListingParseError, RatingFilterMissed, RobotsDenied, CrawlDeadlineError
     │   ├── smoke.py                # crawl_all against stored rows; no POST
-    │   ├── settings.py             # PRODUCTS; PAGE_URL without rate[]; USER_AGENT
+    │   ├── settings.py             # PRODUCTS; PAGE_URL with one rate per pass; USER_AGENT
     │   └── tools.py                # clean_text_pipe (double strip-tags → emoji → strip)
     └── ui/
         ├── __main__.py             # uvicorn entry; auto-traces ui.app + ui.blocks
